@@ -314,6 +314,7 @@ struct server_slot {
             return false;
         }
 
+        cur->pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id);
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -1356,7 +1357,7 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, n_swa);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1746,15 +1747,11 @@ private:
             }
         }
 
-        if (ret && !ret->is_processing()) {
-            if (prompt_cache && !params_base.cache_prompt_dir.empty() && prompt_cache->has_pinned(ret->prompt, task.tokens)) {
+        if (ret && !ret->is_processing() && prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt) {
+            if (!update_cache && !params_base.cache_prompt_dir.empty() &&
+                    prompt_cache->has_pinned(ret->prompt, task.tokens, llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), ret->id))) {
                 update_cache = true;
             }
-            update_cache = update_cache && prompt_cache;
-
-            // cache prompts only for completion tasks
-            update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt;
-
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
@@ -3464,21 +3461,9 @@ private:
 
                                 if (pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
-                                    const auto it = std::find_if(
-                                        slot.prompt.checkpoints.rbegin(),
-                                        slot.prompt.checkpoints.rend(),
-                                        [&](const auto & cur) {
-                                            // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                                            SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
-                                            // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
-                                            if (cur.pos_max > pos_next) {
-                                                return false;
-                                            }
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
-                                        }
-                                    );
+                                    const auto * it = slot.prompt.find_checkpoint(pos_next, pos_min_thold);
 
-                                    bool do_reset = it == slot.prompt.checkpoints.rend();
+                                    bool do_reset = it == nullptr;
 
                                     if (!do_reset) {
                                         // restore the context checkpoint

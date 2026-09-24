@@ -1688,6 +1688,38 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+const common_prompt_checkpoint * server_prompt::find_checkpoint(llama_pos pos_next, llama_pos pos_min_thold) const {
+    for (auto it = checkpoints.rbegin(); it != checkpoints.rend(); ++it) {
+        // Workaround for [TAG_CHECKPOINTS_FIX_POS_MIN].
+        if (it->pos_max <= pos_next && (it->pos_min < pos_min_thold || it->pos_min == 0)) {
+            return &*it;
+        }
+    }
+    return nullptr;
+}
+
+size_t server_prompt::get_reusable_prefix(const server_tokens & tokens_new, llama_pos pos_min, int32_t n_swa) const {
+    size_t n_past = tokens.get_common_prefix(tokens_new);
+    if (n_past == 0 || pos_min < 0) {
+        return 0;
+    }
+
+    llama_pos pos_next = tokens.pos_next(n_past);
+    const bool has_new_tokens = n_past < tokens_new.size();
+    const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
+    if (pos_min >= pos_min_thold) {
+        const auto * checkpoint = find_checkpoint(pos_next, pos_min_thold);
+        if (checkpoint == nullptr) {
+            return 0;
+        }
+        pos_next = std::min(pos_next, std::max(checkpoint->pos_min + 1, checkpoint->pos_max));
+        n_past = std::min(tokens.size_up_to_pos(pos_next), (size_t) checkpoint->n_tokens);
+    }
+
+    // Leave one token to produce logits [TAG_PROMPT_LOGITS].
+    return n_past - (n_past > 0 && n_past == tokens_new.size());
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1698,11 +1730,13 @@ size_t server_prompt_cache::size() const {
     return res;
 }
 
-size_t server_prompt_cache::n_tokens() const {
+size_t server_prompt_cache::n_tokens_ordinary() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        res += state.prompt.n_tokens();
+        if (!state.pinned) {
+            res += state.prompt.n_tokens();
+        }
     }
 
     return res;
@@ -1713,7 +1747,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (!pinned && cur_lcp_len == (int) prompt.tokens.size()) {
+        if (!pinned && cur_lcp_len == prompt.n_tokens() &&
+                (!it->pinned || it->prompt.n_tokens() == prompt.n_tokens())) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
@@ -1745,7 +1780,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (!it->pinned && len == (int) it->prompt.tokens.size()) {
+        if (!it->pinned && len == it->prompt.n_tokens() && (!pinned || len == prompt.n_tokens())) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1756,7 +1791,14 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
-        while (size() + state_size_new > limit_size && evict()) {}
+        size_t size_cur = size();
+        size_t tokens_cur = n_tokens_ordinary();
+        auto it = states.begin();
+        while (size_cur + state_size_new > limit_size) {
+            if (!evict(it, size_cur, tokens_cur)) {
+                break;
+            }
+        }
     }
 
     std::vector<uint8_t> state_data_tgt;
@@ -1793,12 +1835,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::has_pinned(const server_prompt & prompt, const server_tokens & tokens_new) const {
-    const size_t lcp = prompt.tokens.get_common_prefix(tokens_new);
+bool server_prompt_cache::has_pinned(const server_prompt & prompt, const server_tokens & tokens_new, llama_pos pos_min) const {
+    const size_t n_reuse = prompt.get_reusable_prefix(tokens_new, pos_min, n_swa);
     for (const auto & state : states) {
         const size_t n = state.prompt.tokens.size();
-        if (state.pinned && n >= lcp && (n > lcp || prompt.tokens.size() > n) &&
-                state.prompt.tokens.get_common_prefix(tokens_new) == n) {
+        if (state.pinned && state.prompt.tokens.get_common_prefix(tokens_new) == n &&
+                state.prompt.get_reusable_prefix(tokens_new, state.pos_min, n_swa) > n_reuse) {
             return true;
         }
     }
@@ -1810,10 +1852,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         return true;
     }
 
-    int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot);
+    int n_reuse_best = prompt.get_reusable_prefix(tokens_new, pos_min, n_swa);
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
+    float f_keep_best = prompt.tokens.size() > 0 ? float(n_reuse_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+    float f_sim_best  = float(n_reuse_best) / tokens_new.size();
+    const float f_keep_slot = f_keep_best;
 
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
@@ -1828,22 +1872,23 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
-        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+        const int n_reuse_cur = it->prompt.get_reusable_prefix(tokens_new, it->pos_min, n_swa);
+        const float f_keep_cur = float(n_reuse_cur) / it->prompt.tokens.size();
+        const float f_sim_cur  = float(n_reuse_cur) / tokens_new.size();
 
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+        SRV_TRC("   - prompt with length %7zu, lcp = %7d, reusable = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, n_reuse_cur, f_keep_cur, f_sim_cur);
 
         // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
+        if (!it->pinned && f_keep_cur < 0.25f) {
             continue;
         }
 
-        const bool use_pinned = it->pinned && (lcp_cur > lcp_best ||
-                (lcp_cur == lcp_best && it_best == states.end() && prompt.n_tokens() > lcp_best));
-        if (use_pinned || (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur)) {
-            lcp_best    = lcp_cur;
-            f_keep_best = f_keep_cur;
-            f_sim_best  = f_sim_cur;
+        // Compare retention with the slot, so cache order does not affect selection.
+        const bool can_replace = it->pinned || lcp_cur == it->prompt.n_tokens() || f_keep_cur > f_keep_slot;
+        if (can_replace && n_reuse_cur > n_reuse_best) {
+            n_reuse_best = n_reuse_cur;
+            f_keep_best  = f_keep_cur;
+            f_sim_best   = f_sim_cur;
 
             it_best = it;
         }
@@ -1892,11 +1937,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
-bool server_prompt_cache::evict() {
-    for (auto it = states.begin(); it != states.end(); ++it) {
+bool server_prompt_cache::evict(std::list<server_prompt_cache_state>::iterator & it, size_t & size, size_t & n_tokens) {
+    for (; it != states.end(); ++it) {
         if (!it->pinned) {
             SRV_WRN(" - removing oldest prompt cache entry (size = %.3f MiB)\n", it->size() / (1024.0 * 1024.0));
-            states.erase(it);
+            size -= it->size();
+            n_tokens -= it->prompt.n_tokens();
+            it = states.erase(it);
             return true;
         }
     }
@@ -1904,22 +1951,41 @@ bool server_prompt_cache::evict() {
 }
 
 void server_prompt_cache::update() {
-    if (limit_size > 0) {
-        while (size() > limit_size && evict()) {}
+    size_t size_cur = size();
+    size_t tokens_cur = n_tokens_ordinary();
+    size_t size_pinned = 0;
+    for (const auto & state : states) {
+        if (state.pinned) {
+            size_pinned += state.size();
+        }
     }
 
-    // average size per token
-    const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
+    auto it = states.begin();
+    if (limit_size > 0) {
+        while (size_cur > limit_size) {
+            if (!evict(it, size_cur, tokens_cur)) {
+                break;
+            }
+        }
+    }
+
+    // Pinned states share the byte budget, but not the ordinary token budget.
+    const float size_per_token = std::max<float>(1.0f, float(size_cur - size_pinned) / std::max<size_t>(1, tokens_cur));
+    const size_t size_available = limit_size - std::min(limit_size, size_pinned);
 
     // dynamically increase the token limit if it can fit in the memory limit
-    const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
+    const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, size_available/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
-        while (n_tokens() > limit_tokens_cur && evict()) {}
+        while (tokens_cur > limit_tokens_cur) {
+            if (!evict(it, size_cur, tokens_cur)) {
+                break;
+            }
+        }
     }
 
     SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
-            states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+            states.size(), size_cur / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB, pinned: %d\n",
